@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <string>
+#include <dbghelp.h>
 
 int gtfo(const char* text = "")
 {
@@ -90,7 +91,7 @@ int main(int argc, char* argv[])
             printf("        FirstThunk: %08X\n", importDescriptor->FirstThunk);
 
             std::string fakeDef;
-            bool fakeThisShit = modname && !dllExists(modname);
+			bool fakeThisShit = modname && !dllExists(modname) && _strnicmp(modname, "api-ms-win-", 11) != 0;
             if (fakeThisShit)
             {
                 printf("FAKE %s\n", modname);
