@@ -19,6 +19,10 @@ int main(int argc, char* argv[])
     if (!GetSystemDirectoryA(sysdir, MAX_PATH))
         return gtfo("GetSystemDirectory");
 
+	char exedir[MAX_PATH];
+	GetModuleFileNameA(GetModuleHandle(0), exedir, MAX_PATH);
+	*strrchr(exedir, '\\') = '\0';
+
     auto dllExists = [&sysdir](const char* name)
     {
         std::string file(sysdir);
@@ -142,7 +146,9 @@ int main(int argc, char* argv[])
                 std::string defName(modname);
                 defName += ".def";
                 //link /DEF:steam_api64.dll.def /DLL /OUT:steam_api64.dll /NODEFAULTLIB /NOENTRY
-                compileBat += "link\\link.exe /DEF:";
+				compileBat += '\"';
+				compileBat += exedir;
+                compileBat += "\\link\\link.exe\" /DEF:";
                 compileBat += defName;
                 compileBat += " /DLL";
 #ifdef _WIN64
@@ -172,6 +178,7 @@ int main(int argc, char* argv[])
     CloseHandle(hDef);
 
     system("fake");
+	DeleteFileA("fake.bat");
 
     return 0;
 }
