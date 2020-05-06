@@ -15,6 +15,8 @@ int main(int argc, char* argv[])
     if (argc < 2)
         return gtfo("argc");
 
+	bool fakeEverything = argc > 2;
+
     char sysdir[MAX_PATH];
     if (!GetSystemDirectoryA(sysdir, MAX_PATH))
         return gtfo("GetSystemDirectory");
@@ -95,7 +97,7 @@ int main(int argc, char* argv[])
             printf("        FirstThunk: %08X\n", importDescriptor->FirstThunk);
 
             std::string fakeDef;
-			bool fakeThisShit = modname && !dllExists(modname) && _strnicmp(modname, "api-ms-win-", 11) != 0;
+			bool fakeThisShit = fakeEverything || (modname && !dllExists(modname) && _strnicmp(modname, "api-ms-win-", 11) != 0);
             if (fakeThisShit)
             {
                 printf("FAKE %s\n", modname);
