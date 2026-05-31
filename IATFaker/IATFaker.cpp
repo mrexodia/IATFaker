@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <stdio.h>
+#include <string.h>
 #include <string>
 #include <dbghelp.h>
 
@@ -68,6 +69,67 @@ int main(int argc, char* argv[])
     if (pnth->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR_MAGIC)
         return gtfo("IMAGE_NT_OPTIONAL_HDR_MAGIC");
 
+    SIZE_T imageSize = pnth->OptionalHeader.SizeOfImage;
+    auto readableRva = [fileMap, imageSize](ULONGLONG rva, SIZE_T size)
+    {
+        if (rva > imageSize || size > imageSize - (SIZE_T)rva)
+            return false;
+        if (!size)
+            return true;
+
+        auto current = (BYTE*)fileMap + (SIZE_T)rva;
+        auto end = current + size;
+        while (current < end)
+        {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!VirtualQuery(current, &mbi, sizeof(mbi)))
+                return false;
+            if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+                return false;
+            auto regionEnd = (BYTE*)mbi.BaseAddress + mbi.RegionSize;
+            if (regionEnd <= current)
+                return false;
+            current = regionEnd < end ? regionEnd : end;
+        }
+        return true;
+    };
+
+    auto ptrFromRva = [fileMap, readableRva](ULONGLONG rva, SIZE_T size) -> void*
+    {
+        if (!readableRva(rva, size))
+            return nullptr;
+        return (BYTE*)fileMap + (SIZE_T)rva;
+    };
+
+    auto cstrFromRva = [fileMap, imageSize](ULONGLONG rva) -> const char*
+    {
+        if (rva >= imageSize)
+            return nullptr;
+
+        auto start = (BYTE*)fileMap + (SIZE_T)rva;
+        auto current = start;
+        auto imageEnd = (BYTE*)fileMap + imageSize;
+        while (current < imageEnd)
+        {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!VirtualQuery(current, &mbi, sizeof(mbi)))
+                return nullptr;
+            if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+                return nullptr;
+            auto regionEnd = (BYTE*)mbi.BaseAddress + mbi.RegionSize;
+            if (regionEnd <= current)
+                return nullptr;
+            if (regionEnd > imageEnd)
+                regionEnd = imageEnd;
+            for (; current < regionEnd; current++)
+            {
+                if (*current == '\0')
+                    return (const char*)start;
+            }
+        }
+        return nullptr;
+    };
+
     auto importDir = pnth->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     puts("Import Directory");
     printf(" RVA: %08X\n", importDir.VirtualAddress);
@@ -78,17 +140,24 @@ int main(int argc, char* argv[])
 
     std::string compileBat("@echo off\n");
 
-    auto importDescriptor = PIMAGE_IMPORT_DESCRIPTOR(ULONG_PTR(fileMap) + importDir.VirtualAddress);
-    if (!IsBadReadPtr((char*)fileMap + importDir.VirtualAddress, 0x1000))
+    auto importDescriptor = PIMAGE_IMPORT_DESCRIPTOR(ptrFromRva(importDir.VirtualAddress, sizeof(IMAGE_IMPORT_DESCRIPTOR)));
+    if (importDescriptor)
     {
-        for (; importDescriptor->FirstThunk; importDescriptor++)
+        for (DWORD descriptorRva = importDir.VirtualAddress; ; descriptorRva += sizeof(IMAGE_IMPORT_DESCRIPTOR))
         {
+            importDescriptor = PIMAGE_IMPORT_DESCRIPTOR(ptrFromRva(descriptorRva, sizeof(IMAGE_IMPORT_DESCRIPTOR)));
+            if (!importDescriptor)
+            {
+                puts("INVALID IMPORT DESCRIPTOR");
+                break;
+            }
+            if (!importDescriptor->OriginalFirstThunk && !importDescriptor->FirstThunk && !importDescriptor->Name)
+                break;
+
             printf("OriginalFirstThunk: %08X\n", importDescriptor->OriginalFirstThunk);
             printf("     TimeDateStamp: %08X\n", importDescriptor->TimeDateStamp);
             printf("    ForwarderChain: %08X\n", importDescriptor->ForwarderChain);
-            const char* modname = nullptr;
-            if (!IsBadReadPtr((char*)fileMap + importDescriptor->Name, 0x1000))
-                modname = (char*)fileMap + importDescriptor->Name;
+            const char* modname = cstrFromRva(importDescriptor->Name);
             if(modname)
                 printf("              Name: %08X \"%s\"\n", importDescriptor->Name, modname);
             else
@@ -97,7 +166,7 @@ int main(int argc, char* argv[])
             printf("        FirstThunk: %08X\n", importDescriptor->FirstThunk);
 
             std::string fakeDef;
-			bool fakeThisShit = fakeEverything || (modname && !dllExists(modname) && _strnicmp(modname, "api-ms-win-", 11) != 0);
+			bool fakeThisShit = modname && (fakeEverything || (!dllExists(modname) && _strnicmp(modname, "api-ms-win-", 11) != 0));
             if (fakeThisShit)
             {
                 printf("FAKE %s\n", modname);
@@ -108,18 +177,26 @@ int main(int argc, char* argv[])
                 fakeDef += "\n";
             }
 
-            auto thunkData = PIMAGE_THUNK_DATA(ULONG_PTR(fileMap) + importDescriptor->FirstThunk);
-            for (; thunkData->u1.AddressOfData; thunkData++)
+            DWORD thunkRva = importDescriptor->OriginalFirstThunk ? importDescriptor->OriginalFirstThunk : importDescriptor->FirstThunk;
+            for (;; thunkRva += sizeof(IMAGE_THUNK_DATA))
             {
-                auto rva = ULONG_PTR(thunkData) - ULONG_PTR(fileMap);
+                auto thunkData = PIMAGE_THUNK_DATA(ptrFromRva(thunkRva, sizeof(IMAGE_THUNK_DATA)));
+                if (!thunkData)
+                {
+                    printf("             Function: %08X INVALID THUNK\n", thunkRva);
+                    break;
+                }
 
                 auto data = thunkData->u1.AddressOfData;
-                if (data & IMAGE_ORDINAL_FLAG)
+                if (!data)
+                    break;
+
+                if (IMAGE_SNAP_BY_ORDINAL(data))
                 {
-                    auto ordinal = data & ~IMAGE_ORDINAL_FLAG;
-                    printf("              Ordinal: %p\n", (void*)ordinal);
+                    auto ordinal = IMAGE_ORDINAL(data);
+                    printf("              Ordinal: %u\n", (unsigned)ordinal);
                     char ordname[256];
-                    sprintf_s(ordname, "%zu", ordinal);
+                    sprintf_s(ordname, "%u", (unsigned)ordinal);
                     auto fakename = std::string("__fake") + ordname;
                     fakeDef += fakename;
                     fakeDef += " @";
@@ -129,10 +206,9 @@ int main(int argc, char* argv[])
                 }
                 else
                 {
-                    auto importByName = PIMAGE_IMPORT_BY_NAME(ULONG_PTR(fileMap) + data);
-                    if (!IsBadReadPtr(importByName, 0x1000))
+                    auto impname = cstrFromRva(data + FIELD_OFFSET(IMAGE_IMPORT_BY_NAME, Name));
+                    if (impname)
                     {
-                        auto impname = (char*)importByName->Name;
                         printf("             Function: %p \"%s\"\n", (void*)data, impname);
                         fakeDef += impname;
                         fakeDef += " = kernel32.DebugBreak";
@@ -154,7 +230,7 @@ int main(int argc, char* argv[])
                 compileBat += defName;
                 compileBat += " /DLL";
 #ifdef _WIN64
-                compileBat += " /MACHINE:X86";
+                compileBat += " /MACHINE:X64";
 #else
                 compileBat += " /MACHINE:X86";
 #endif
